@@ -1,0 +1,12 @@
+.venv/*
+*.npy
+*.json
+*.html
+*.pdf
+log/*
+logs/*
+Json_object/*
+outputs/*
+sample_data/*
+tmp/*
+__pycache__

@@ -1,0 +1,261 @@
+from typing import List
+import tiktoken
+import re
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from nltk.tokenize import sent_tokenize
+from logger_config import get_logger
+
+logger = get_logger(__file__)
+
+# Download required NLTK data (run once)
+try:
+    nltk.download('punkt_tab')
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    try:
+        nltk.download('punkt')
+    except Exception as e:
+        logger.error(f"Failed to download NLTK data: {str(e)}")
+        raise
+
+
+class ChunkProcessor:
+    def __init__(self, max_chunk_size: int = 1024, model_name: str = 'nomic-ai/nomic-embed-text-v1'):
+        self.max_chunk_size = max_chunk_size
+        self.similarity_threshold = 0.7  # Threshold for semantic similarity
+        
+        # Initialize sentence transformer model
+        try:
+            self.model = SentenceTransformer(model_name, trust_remote_code=True)
+        except Exception as e:
+            logger.warning(f"Failed to load primary model {model_name}: {str(e)}")
+            raise
+
+    def count_tokens(self, text: str, model_name: str = "gpt-4") -> int:
+        """Count the number of tokens in a text string."""
+        try:
+            # Use tiktoken for OpenAI models
+            encoding = tiktoken.encoding_for_model(model_name)
+            return len(encoding.encode(text))
+        except Exception as e:
+            logger.warning(f"Error using tiktoken: {str(e)}")
+            # Fall back to rough estimate
+            return len(text.split())
+
+    def get_sentences(self, text: str) -> List[str]:
+        """Split text into sentences using NLTK."""
+        try:
+            sentences = sent_tokenize(text)
+            return [s.strip() for s in sentences if s.strip()]
+        except Exception as e:
+            logger.warning(f"Error in sentence tokenization: {str(e)}")
+            # Fallback to simple splitting
+            return [s.strip() for s in text.split('.') if s.strip()]
+
+    def compute_sentence_similarities(self, sentences: List[str]) -> np.ndarray:
+        """Compute cosine similarities between consecutive sentences."""
+        if len(sentences) < 2:
+            return np.array([])
+        
+        try:
+            # Get embeddings for all sentences
+            embeddings = self.model.encode(sentences)
+            
+            # Compute similarities between consecutive sentences
+            similarities = []
+            for i in range(len(sentences) - 1):
+                sim = cosine_similarity([embeddings[i]], [embeddings[i + 1]])[0][0]
+                similarities.append(sim)
+            
+            return np.array(similarities)
+        except Exception as e:
+            logger.error(f"Error computing similarities: {str(e)}")
+            # Fallback to simple similarity (all sentences considered different)
+            return np.zeros(len(sentences) - 1)
+
+    def find_semantic_boundaries(self, sentences: List[str]) -> List[int]:
+        """Find semantic boundaries where topic shifts occur."""
+        if len(sentences) <= 1:
+            return []
+        
+        similarities = self.compute_sentence_similarities(sentences)
+        
+        # Find positions where similarity drops below threshold
+        boundaries = []
+        for i, sim in enumerate(similarities):
+            if sim < self.similarity_threshold:
+                boundaries.append(i + 1)  # +1 because we want to split after the sentence
+        
+        return boundaries
+
+    def create_semantic_chunks(self, sentences: List[str], boundaries: List[int]) -> List[str]:
+        """Create chunks based on semantic boundaries while respecting token limits."""
+        if not sentences:
+            return []
+        
+        chunks = []
+        current_chunk_sentences = []
+        current_tokens = 0
+        
+        # Add sentence indices for boundary checking
+        boundary_set = set(boundaries)
+        
+        for i, sentence in enumerate(sentences):
+            sentence_tokens = self.count_tokens(sentence)
+            
+            # Check if adding this sentence would exceed token limit
+            if current_tokens + sentence_tokens > self.max_chunk_size and current_chunk_sentences:
+                # Finalize current chunk
+                chunks.append(' '.join(current_chunk_sentences))
+                current_chunk_sentences = [sentence]
+                current_tokens = sentence_tokens
+            else:
+                current_chunk_sentences.append(sentence)
+                current_tokens += sentence_tokens
+            
+            # Check if we hit a semantic boundary and have a reasonable chunk size
+            if (i + 1) in boundary_set and current_chunk_sentences:
+                # Only create boundary if we have enough content or are forced to
+                if current_tokens >= self.max_chunk_size * 0.3 or current_tokens + self.count_tokens(sentences[i + 1] if i + 1 < len(sentences) else "") > self.max_chunk_size:
+                    chunks.append(' '.join(current_chunk_sentences))
+                    current_chunk_sentences = []
+                    current_tokens = 0
+        
+        # Add remaining sentences as final chunk
+        if current_chunk_sentences:
+            chunks.append(' '.join(current_chunk_sentences))
+        
+        return chunks
+
+    def chunk_text(self, text: str) -> List[str]:
+        """Split text into semantic chunks while respecting token limits."""
+        if not text:
+            return []
+        
+        # First check if chunking is needed
+        total_tokens = self.count_tokens(text)
+        if total_tokens <= self.max_chunk_size:
+            return [text]
+        
+        # Split into sentences
+        sentences = self.get_sentences(text)
+        
+        if len(sentences) <= 1:
+            # Fallback to word-based chunking for single sentence
+            return self.fallback_word_chunking(text)
+        
+        # Find semantic boundaries
+        boundaries = self.find_semantic_boundaries(sentences)
+        
+        # Create chunks based on semantic boundaries
+        chunks = self.create_semantic_chunks(sentences, boundaries)
+        
+        # Verify and fix oversized chunks
+        final_chunks = []
+        for chunk in chunks:
+            chunk_tokens = self.count_tokens(chunk)
+            if chunk_tokens > self.max_chunk_size:
+                # Split oversized chunks further
+                sub_sentences = self.get_sentences(chunk)
+                if len(sub_sentences) > 1:
+                    # Use smaller semantic chunks
+                    sub_boundaries = self.find_semantic_boundaries(sub_sentences)
+                    sub_chunks = self.create_semantic_chunks(sub_sentences, sub_boundaries)
+                    for sub_chunk in sub_chunks:
+                        if self.count_tokens(sub_chunk) > self.max_chunk_size:
+                            final_chunks.extend(self.fallback_word_chunking(sub_chunk))
+                        else:
+                            final_chunks.append(sub_chunk)
+                else:
+                    # Fallback to word chunking
+                    final_chunks.extend(self.fallback_word_chunking(chunk))
+            else:
+                final_chunks.append(chunk)
+        
+        return final_chunks
+
+    def fallback_word_chunking(self, text: str) -> List[str]:
+        """Fallback word-based chunking for edge cases."""
+        words = text.split()
+        chunks = []
+        current_chunk = ""
+        current_tokens = 0
+        
+        for word in words:
+            word_tokens = self.count_tokens(word + " ")
+            if current_tokens + word_tokens > self.max_chunk_size and current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = word + " "
+                current_tokens = word_tokens
+            else:
+                current_chunk += word + " "
+                current_tokens += word_tokens
+        
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
+    def create_chunks(self, input_text: str) -> List[str]:
+        """
+        Split a large text file into chunks based on semantic boundaries and token size.
+        
+        Args:
+            input_text: Input text string
+
+        Returns:
+            List of text chunks
+        """
+        try:
+            text = input_text
+            
+            token_count = self.count_tokens(text)
+            logger.info(f"Document contains {token_count} tokens")
+            
+            if token_count <= self.max_chunk_size:
+                logger.info("Document size is within limit. No chunking required.")
+                return [text]
+            
+            logger.info(f"Document exceeds token limit of {self.max_chunk_size}. Splitting into semantic chunks...")
+            
+            chunks = self.chunk_text(text)
+            logger.info(f"Split document into {len(chunks)} chunks using semantic boundaries")
+            
+            # logger.info chunk statistics
+            for i, chunk in enumerate(chunks):
+                chunk_tokens = self.count_tokens(chunk)
+                logger.info(f"Chunk {i+1}: {chunk_tokens} tokens")
+            
+            return chunks
+        except Exception as e:
+            logger.error(f"Error in chunk creation: {str(e)}")
+            # Fallback to simple chunking
+            return self.fallback_word_chunking(text)
+
+
+if __name__ == "__main__":
+    chunk_processor = ChunkProcessor()
+    # Read data from the txt file
+    input_file_path = "input_data/rfp_pdf_extracted.txt"
+    try:
+        with open(input_file_path, "r", encoding="utf-8") as f:
+            file_text = f.read()
+        logger.info(f"Successfully read data from {input_file_path}")
+    except Exception as e:
+        logger.error(f"Failed to read file {input_file_path}: {str(e)}")
+        file_text = ""
+    chunks = chunk_processor.create_chunks(file_text)
+
+    for idx, chunk in enumerate(chunks):
+        logger.info("\n")
+        logger.info(f"-------------------chunk {idx+1}----------------------------")
+        logger.info("\n")
+        logger.info(chunk)
+        logger.info("\n")
+        logger.info("\n")
+
+    logger.info(f"\n Created {len(chunks)} chunks")

@@ -1,0 +1,21 @@
+
+
+# We need to install libreoffice if our system is linux for docx to pdf conversion to work on linux
+
+
+# Also if we encounter import error for ""from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes"
+
+    Even if you installed pycryptodome or pycryptodomex, the import can still fail if any of these is true:
+
+        You have the wrong package installed (crypto instead of pycryptodome)
+        You have both crypto and pycryptodome(x) installed → conflict
+        You're in a virtual environment where the library isn't installed
+        You're using pycryptodomex but still trying to import from Crypto (capital C)
+
+    Solution
+    # 1. Completely remove conflicting/broken packages
+    pip uninstall crypto pycrypto pycryptodome pycryptodomex -y
+
+    # 2. Install the correct, maintained library
+    pip install pycryptodome
