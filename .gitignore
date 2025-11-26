@@ -10,3 +10,4 @@ outputs/*
 sample_data/*
 tmp/*
 __pycache__
+.env
